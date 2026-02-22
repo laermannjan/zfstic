@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# zfstic — ZFS snapshot management inspired by restic
+# https://github.com/laermannjan/zfstic
+#
+# Requirements: bash 4+, awk (gawk/mawk/BSD awk with strftime), zfs in PATH
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Usage
+# ──────────────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'EOF'
+zfstic — ZFS snapshot management inspired by restic
+
+USAGE:
+    zfstic <command> [options]
+
+COMMANDS:
+    forget    Remove snapshots according to a retention policy
+    snapshot  Create a new snapshot
+    version   Show version
+    help      Show this help
+
+Run 'zfstic <command> --help' for command-specific help.
+EOF
+}
+
+usage_forget() {
+    cat <<'EOF'
+zfstic forget — Remove snapshots according to a retention policy
+
+USAGE:
+    zfstic forget [options] <dataset>
+
+OPTIONS:
+    --keep-last    n    Keep the n most recent snapshots unconditionally
+    --keep-hourly  n    Keep the most recent snapshot per hour, up to n hours
+    --keep-daily   n    Keep the most recent snapshot per day, up to n days
+    --keep-weekly  n    Keep the most recent snapshot per ISO week, up to n weeks
+    --keep-monthly n    Keep the most recent snapshot per month, up to n months
+    --keep-yearly  n    Keep the most recent snapshot per year, up to n years
+    -r, --recursive     Apply to dataset and all child datasets independently
+    -n, --dry-run       Show what would be removed without actually removing
+    --prefix <pfx>      Only consider snapshots whose name starts with <pfx>
+    -h, --help          Show this help
+
+NOTES:
+    At least one --keep-* option is required as a safety guard.
+
+    The most recently created snapshot is ALWAYS kept regardless of policy
+    (shown as reason "latest"). This ensures syncoid can always find a common
+    base snapshot for incremental replication.
+
+    IMPORTANT — when using with syncoid, replicate BEFORE forgetting locally:
+
+        zfstic snapshot tank/data --label hourly
+        syncoid tank/data backup@remote:tank/backup     # replicate first
+        zfstic forget tank/data --keep-hourly 24        # then prune local
+        ssh backup@remote zfstic forget tank/backup \
+            --keep-monthly 12 --keep-yearly 5           # prune remote with different policy
+
+    syncoid matches snapshots by GUID (not name). As long as you replicate
+    before forgetting, the newest local snapshot will exist on both sides,
+    giving syncoid a common base for the next incremental send.
+
+    Caveat: syncoid must run at least as often as your local retention window.
+    If local keeps 24 hourly snapshots but syncoid only runs weekly, the common
+    snapshot will eventually fall outside the local window and syncoid will need
+    to do a full send.
+
+EXAMPLES:
+    # Keep 24 hourly + 7 daily locally, preview first
+    zfstic forget --keep-hourly 24 --keep-daily 7 --dry-run tank/data
+
+    # Apply recursively to dataset and all children
+    zfstic forget --keep-hourly 24 --keep-daily 7 -r tank
+
+    # Only manage zfstic-created snapshots (leave sanoid snapshots alone)
+    zfstic forget --keep-daily 7 --prefix zfstic- tank/data
+EOF
+}
+
+usage_snapshot() {
+    cat <<'EOF'
+zfstic snapshot — Create a new ZFS snapshot
+
+USAGE:
+    zfstic snapshot [options] <dataset>
+
+OPTIONS:
+    --label <name>   Append a label to the snapshot name
+    -r, --recursive  Snapshot dataset and all children atomically
+    -h, --help       Show this help
+
+SNAPSHOT NAMING:
+    Without label:  <dataset>@zfstic-2026-02-22T10:00:00
+    With label:     <dataset>@zfstic-2026-02-22T10:00:00-hourly
+
+    Timestamps are UTC. Use --prefix zfstic- with forget to scope retention
+    to only zfstic-managed snapshots.
+
+EXAMPLES:
+    zfstic snapshot tank/data
+    zfstic snapshot --label hourly tank/data
+    zfstic snapshot -r --label daily tank
+EOF
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# apply_retention <dataset> <keep_last> <keep_hourly> <keep_daily>
+#                 <keep_weekly> <keep_monthly> <keep_yearly> <prefix> <dry_run>
+#
+# Lists snapshots for the given dataset, applies retention policies via a single
+# awk pass, prints the keep/remove plan, and destroys the removes (unless dry_run).
+# ──────────────────────────────────────────────────────────────────────────────
+
+apply_retention() {
+    local dataset="$1"
+    local keep_last="$2"
+    local keep_hourly="$3"
+    local keep_daily="$4"
+    local keep_weekly="$5"
+    local keep_monthly="$6"
+    local keep_yearly="$7"
+    local prefix="$8"
+    local dry_run="${9}"
+
+    # List snapshots for this dataset only (no recursion; caller handles that).
+    # -p gives parseable (epoch) timestamps. Sort newest-first.
+    local raw
+    raw=$(zfs list -H -p -t snapshot -o name,creation "$dataset" 2>/dev/null \
+        | sort -t$'\t' -k2 -rn) || {
+        printf 'warning: could not list snapshots for %s\n' "$dataset" >&2
+        return 0
+    }
+
+    # Filter by prefix when requested
+    if [[ -n "$prefix" ]]; then
+        raw=$(printf '%s\n' "$raw" | awk -F'\t' -v pfx="$prefix" '{
+            n = split($1, a, "@")
+            if (substr(a[n], 1, length(pfx)) == pfx) print
+        }')
+    fi
+
+    [[ -z "$raw" ]] && return 0
+
+    # ── Retention algorithm ────────────────────────────────────────────────────
+    # Single awk pass over snapshots (sorted newest-first).
+    # For each enabled policy, keep the most recent snapshot per time bucket
+    # (hour / day / ISO-week / month / year), up to the configured limit.
+    # A snapshot kept by multiple policies accumulates all reasons.
+    #
+    # Implicit keep-latest: if no policy keeps the newest snapshot, it is kept
+    # anyway with reason "latest". This guarantees syncoid always has a common
+    # base for incremental replication after local retention is applied.
+    #
+    # Output (tab-separated): action  snap_name  epoch  reasons  display_date
+    local results
+    results=$(printf '%s\n' "$raw" | awk \
+        -v kl="$keep_last"    \
+        -v kh="$keep_hourly"  \
+        -v kd="$keep_daily"   \
+        -v kw="$keep_weekly"  \
+        -v km="$keep_monthly" \
+        -v ky="$keep_yearly"  \
+    'BEGIN {
+        cnt_l=0; cnt_h=0; cnt_d=0; cnt_w=0; cnt_m=0; cnt_y=0
+        total=0
+    }
+    {
+        full  = $1
+        epoch = $2
+        at    = index(full, "@")
+        snap  = substr(full, at + 1)
+        dt    = strftime("%Y-%m-%d %H:%M:%S", epoch)
+        total++
+
+        reasons = ""
+
+        # --keep-last: keep the N most recent unconditionally
+        if (kl > 0 && cnt_l < kl) {
+            reasons = reasons (reasons ? ", " : "") "last"
+            cnt_l++
+        }
+
+        # --keep-hourly
+        if (kh > 0) {
+            b = strftime("%Y%m%d%H", epoch)
+            if (!(b in sh) && cnt_h < kh) {
+                reasons = reasons (reasons ? ", " : "") "hourly"
+                sh[b] = 1; cnt_h++
+            }
+        }
+
+        # --keep-daily
+        if (kd > 0) {
+            b = strftime("%Y%m%d", epoch)
+            if (!(b in sd) && cnt_d < kd) {
+                reasons = reasons (reasons ? ", " : "") "daily"
+                sd[b] = 1; cnt_d++
+            }
+        }
+
+        # --keep-weekly  (%V = ISO week num; %Y used instead of %G for mawk compat;
+        #                 minor year-boundary edge case on Dec 28 - Jan 3 accepted)
+        if (kw > 0) {
+            b = strftime("%Y%V", epoch)
+            if (!(b in sw) && cnt_w < kw) {
+                reasons = reasons (reasons ? ", " : "") "weekly"
+                sw[b] = 1; cnt_w++
+            }
+        }
+
+        # --keep-monthly
+        if (km > 0) {
+            b = strftime("%Y%m", epoch)
+            if (!(b in sm) && cnt_m < km) {
+                reasons = reasons (reasons ? ", " : "") "monthly"
+                sm[b] = 1; cnt_m++
+            }
+        }
+
+        # --keep-yearly
+        if (ky > 0) {
+            b = strftime("%Y", epoch)
+            if (!(b in sy) && cnt_y < ky) {
+                reasons = reasons (reasons ? ", " : "") "yearly"
+                sy[b] = 1; cnt_y++
+            }
+        }
+
+        # Implicit keep-latest safety: if newest snapshot would be removed, save it
+        if (total == 1 && reasons == "") {
+            reasons = "latest"
+        }
+
+        if (reasons != "") {
+            print "keep"   "\t" snap "\t" epoch "\t" reasons "\t" dt
+        } else {
+            print "remove" "\t" snap "\t" epoch "\t"         "\t" dt
+        }
+    }')
+
+    # Count outcomes
+    local n_keep n_remove n_total
+    n_keep=$(awk -F'\t' '$1=="keep"  {c++} END{print c+0}' <<< "$results")
+    n_remove=$(awk -F'\t' '$1=="remove"{c++} END{print c+0}' <<< "$results")
+    n_total=$(( n_keep + n_remove ))
+
+    # ── Print plan ─────────────────────────────────────────────────────────────
+    local sep="────────────────────────────────────────────────────────────"
+    printf '\n%s\n%s\n' "$dataset" "$sep"
+
+    if [[ "$dry_run" == "true" ]]; then
+        printf 'Would keep %d of %d snapshot(s)\n' "$n_keep" "$n_total"
+    else
+        printf 'Keeping %d of %d snapshot(s)\n' "$n_keep" "$n_total"
+    fi
+
+    if [[ "$n_keep" -gt 0 ]]; then
+        printf '\n  To keep:\n'
+        while IFS=$'\t' read -r action snap _epoch reasons dt; do
+            [[ "$action" != "keep" ]] && continue
+            printf '    %-19s  %-48s  %s\n' "$dt" "$snap" "$reasons"
+        done <<< "$results"
+    fi
+
+    if [[ "$n_remove" -gt 0 ]]; then
+        if [[ "$dry_run" == "true" ]]; then
+            printf '\n  Would remove:\n'
+        else
+            printf '\n  To remove:\n'
+        fi
+        while IFS=$'\t' read -r action snap _epoch _reasons dt; do
+            [[ "$action" != "remove" ]] && continue
+            printf '    %-19s  %s\n' "$dt" "$snap"
+        done <<< "$results"
+    fi
+
+    # ── Destroy (unless dry-run) ───────────────────────────────────────────────
+    if [[ "$dry_run" != "true" && "$n_remove" -gt 0 ]]; then
+        local errors=0
+        while IFS=$'\t' read -r action snap _epoch _reasons _dt; do
+            [[ "$action" != "remove" ]] && continue
+            if ! zfs destroy "${dataset}@${snap}"; then
+                printf 'error: failed to destroy %s@%s\n' "$dataset" "$snap" >&2
+                errors=$(( errors + 1 ))
+            fi
+        done <<< "$results"
+        [[ "$errors" -gt 0 ]] && return 1
+    fi
+
+    return 0
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# forget command
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_forget() {
+    local keep_last=0 keep_hourly=0 keep_daily=0 keep_weekly=0
+    local keep_monthly=0 keep_yearly=0
+    local recursive=false dry_run=false prefix="" dataset=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --keep-last)    keep_last="${2:?'--keep-last requires a value'}";    shift 2 ;;
+            --keep-hourly)  keep_hourly="${2:?'--keep-hourly requires a value'}";  shift 2 ;;
+            --keep-daily)   keep_daily="${2:?'--keep-daily requires a value'}";   shift 2 ;;
+            --keep-weekly)  keep_weekly="${2:?'--keep-weekly requires a value'}";  shift 2 ;;
+            --keep-monthly) keep_monthly="${2:?'--keep-monthly requires a value'}"; shift 2 ;;
+            --keep-yearly)  keep_yearly="${2:?'--keep-yearly requires a value'}";  shift 2 ;;
+            -r|--recursive) recursive=true; shift ;;
+            -n|--dry-run)   dry_run=true;   shift ;;
+            --prefix)       prefix="${2:?'--prefix requires a value'}"; shift 2 ;;
+            -h|--help)      usage_forget; return 0 ;;
+            -*)  printf 'error: unknown option: %s\n' "$1" >&2; return 1 ;;
+            *)   dataset="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$dataset" ]]; then
+        printf 'error: dataset argument required\n' >&2
+        usage_forget >&2
+        return 1
+    fi
+
+    local policy_sum=$(( keep_last + keep_hourly + keep_daily + keep_weekly + keep_monthly + keep_yearly ))
+    if [[ "$policy_sum" -eq 0 ]]; then
+        printf 'error: no retention policy specified; provide at least one --keep-* flag\n' >&2
+        return 1
+    fi
+
+    # Collect datasets: given dataset only, or it plus all descendants
+    local datasets
+    if [[ "$recursive" == "true" ]]; then
+        datasets=$(zfs list -H -r -o name -t filesystem,volume "$dataset")
+    else
+        datasets="$dataset"
+    fi
+
+    local errors=0
+    while IFS= read -r ds; do
+        apply_retention "$ds" \
+            "$keep_last" "$keep_hourly" "$keep_daily" \
+            "$keep_weekly" "$keep_monthly" "$keep_yearly" \
+            "$prefix" "$dry_run" || errors=$(( errors + 1 ))
+    done <<< "$datasets"
+
+    if [[ "$dry_run" == "true" ]]; then
+        printf '\n[dry run] No snapshots were removed.\n'
+    fi
+
+    [[ "$errors" -gt 0 ]] && return 1
+    return 0
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# snapshot command
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_snapshot() {
+    local label="" recursive=false dataset=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --label)        label="${2:?'--label requires a value'}"; shift 2 ;;
+            -r|--recursive) recursive=true; shift ;;
+            -h|--help)      usage_snapshot; return 0 ;;
+            -*)  printf 'error: unknown option: %s\n' "$1" >&2; return 1 ;;
+            *)   dataset="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$dataset" ]]; then
+        printf 'error: dataset argument required\n' >&2
+        return 1
+    fi
+
+    local ts snap_name
+    ts=$(date -u +%Y-%m-%dT%H:%M:%S)
+    snap_name="zfstic-${ts}"
+    [[ -n "$label" ]] && snap_name="${snap_name}-${label}"
+
+    local args=()
+    [[ "$recursive" == "true" ]] && args+=(-r)
+
+    zfs snapshot "${args[@]}" "${dataset}@${snap_name}"
+    printf 'Created %s@%s\n' "$dataset" "$snap_name"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────────
+
+main() {
+    if [[ $# -eq 0 ]]; then usage; exit 0; fi
+
+    case "$1" in
+        forget)            shift; cmd_forget "$@" ;;
+        snapshot)          shift; cmd_snapshot "$@" ;;
+        help|-h|--help)    usage ;;
+        version|--version) printf 'zfstic %s\n' "$VERSION" ;;
+        *) printf 'error: unknown command: %s\n' "$1" >&2; usage >&2; exit 1 ;;
+    esac
+}
+
+main "$@"
