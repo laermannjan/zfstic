@@ -53,25 +53,16 @@ Your cron job runs once an hour:
 0 * * * * zfstic snapshot tank/documents
 ```
 
-That's it. `snapshot` is essentially `zfs snapshot` with a `zfstic-` prefix and
-a local timestamp - just enough structure for `forget` to work with. Snapshots
-come out looking like `tank/documents@zfstic-2026-02-23T09:00:00CET`.
+`snapshot` is `zfs snapshot` with a `zfstic-` prefix and a local timestamp.
+Snapshots look like `tank/documents@zfstic-2026-02-23T09:00:00CET`.
 
-Before a risky operation you take an ad-hoc snapshot with a label:
+Before a risky operation, add a label:
 
 ```bash
 zfstic snapshot --label pre-migration tank/documents
 ```
 
-Today is Monday Feb 23. You ran that at 09:43, between two cron shots, before
-kicking off a migration. There's also one from three days ago, Feb 21 at 14:43,
-before an app upgrade:
-
-```bash
-zfstic snapshot --label app-upgrade tank/documents
-```
-
-Now run `forget` with a policy:
+Now apply a policy:
 
 ```bash
 zfstic forget \
@@ -83,79 +74,91 @@ zfstic forget \
 ```
 
   tank/documents:
-    keep    zfstic-2026-02-23T11:00:00CET  [last]
-    keep    zfstic-2026-02-23T10:00:00CET  [last]
+    keep    zfstic-2026-02-23T11:00:00CET                [last]
+    keep    zfstic-2026-02-23T10:00:00CET                [last]
     keep    zfstic-2026-02-23T09:43:00CET-pre-migration  [last]
-    keep    zfstic-2026-02-23T09:00:00CET  [last]
-    keep    zfstic-2026-02-23T08:00:00CET  [last]
+    keep    zfstic-2026-02-23T09:00:00CET                [last]
+    keep    zfstic-2026-02-23T08:00:00CET                [last]
     remove  zfstic-2026-02-23T07:00:00CET
     ...
-    keep    zfstic-2026-02-23T00:00:00CET  [daily, weekly]
+    keep    zfstic-2026-02-23T00:00:00CET                [daily, weekly]
     remove  zfstic-2026-02-22T23:00:00CET
     ...
-    keep    zfstic-2026-02-22T00:00:00CET  [daily]
+    keep    zfstic-2026-02-22T00:00:00CET                [daily]
     remove  zfstic-2026-02-21T23:00:00CET
     ...
-    remove  zfstic-2026-02-21T14:43:00CET-app-upgrade
+    remove  zfstic-2026-02-21T13:17:00CET-app-upgrade
     ...
-    keep    zfstic-2026-02-21T00:00:00CET  [daily]
+    keep    zfstic-2026-02-21T00:00:00CET                [daily]
     remove  zfstic-2026-02-20T23:00:00CET
     ...
     remove  zfstic-2026-02-17T00:00:00CET
-    keep    zfstic-2026-02-16T00:00:00CET  [weekly]
+    keep    zfstic-2026-02-16T00:00:00CET                [weekly]
     --- 9 keep, 185 remove --- (dry run)
 
 ```
 
-`--keep-last 5` grabbed the five most recent snapshots. The `pre-migration` snap
-squeaked in at third place.
+`pre-migration` survived because `--keep-last 5` is unconditional. `app-upgrade`
+at 13:17 on 2026-02-21 didn't - there's a midnight snapshot that day, and zfstic
+keeps the *oldest* snapshot per period.
 
-Three days back, `app-upgrade` at 14:43 on Feb 21 didn't make it. Not in the last
-5, and not the oldest snapshot of its day - the midnight cron shot is. So it's gone.
+That's the core design. Keeping the oldest ensures each policy anchors to a
+distinct point in time. If zfstic kept the newest instead, `--keep-daily 1
+--keep-weekly 1 --keep-monthly 1` would all converge on the same snapshot.
 
-This is a deliberate design choice. For each time period, zfstic keeps the *oldest*
-snapshot in it, not the newest. The reason: if it kept the newest, `--keep-daily 1
---keep-weekly 1 --keep-monthly 1 --keep-yearly 1` would all select the same
-snapshot - the most recent one - and you'd end up with one snapshot no matter how
-many policies you stack. By anchoring to the oldest, each policy reaches a
-genuinely different point in time. This is where zfstic differs from restic.
+`--keep-daily 3` covers the last 3 calendar days. `--keep-weekly 2` covers the
+last 2 ISO weeks. Policies don't stack or extend each other - days with no
+snapshots contribute nothing. Today is Monday, so 2026-02-23 00:00 qualifies for
+both and shows `[daily, weekly]`; it survives once. 2026-02-16, the oldest
+snapshot of the previous ISO week, is kept by `--keep-weekly 2`. Everything in
+between that no policy touches is gone.
 
-`--keep-daily 3` means: look at the last 3 calendar days (Feb 21, 22, 23) and keep
-the oldest snapshot in each. `--keep-weekly 2` does the same for the last 2 ISO
-weeks. These policies are independent - they don't stack or extend each other. A
-day or week with no snapshots doesn't consume a slot, so if you snapshot weekly,
-`--keep-daily 7` gives you at most 7 snapshots, but they might span 7 weeks.
+---
 
-Today is a Monday. Feb 23 00:00 is the first snapshot of the current ISO week, so
-both `--keep-daily 3` and `--keep-weekly 2` claim it. One claim is enough - it
-survives once. Feb 16 is also a Monday, and the oldest snapshot of the previous
-ISO week, so `--keep-weekly 2` keeps it as the anchor for that period. Everything
-between Feb 17 and Feb 22 that no policy wants is gone.
+ZFS snapshots are independent - each is a complete view of the filesystem state
+at a point in time. They share blocks (copy-on-write) but are not dependent on
+each other. Incremental sends work by birth transaction group: every block is
+stamped with the txg in which it was written. A send from point A to snapshot B
+walks B's block tree and ships only blocks born after A. O(changed data), not
+O(dataset size).
 
-Before running `forget` for real, replicate first:
+The source only needs a reference to point A - a snapshot or a bookmark (just a
+GUID and txg, no data). The destination needs the actual snapshot at A, because
+the incremental stream omits blocks already present there and the destination has
+to reconstruct B from A plus the delta. Without that base snapshot on the remote,
+the stream can't be applied and a full send is required.
+
+By default, syncoid manages this automatically: before each send it creates a
+`syncoid_`-prefixed snapshot on both source and destination, and deletes old ones.
+These serve as the common anchor for incremental sends. zfstic's default
+`--prefix zfstic-` means `forget` won't touch them - they're invisible to
+retention policies. This is the simplest setup and the one we recommend.
+
+For lighter source-side footprint, `syncoid --create-bookmark --no-sync-snap`
+creates a bookmark on the source instead of a `syncoid_` snapshot - no sync
+snapshot is created or managed on the source at all. The destination still needs
+its snapshot - and it's always there: `forget` never removes the youngest snapshot,
+which is exactly the one the source's bookmark points to. You can also manage
+everything manually with `zfs snapshot`, `zfs bookmark`, and `zfs send` if you
+prefer full control.
+
+What still matters is coverage: if the remote should hold daily snapshots, local
+must have those daily snapshots at replication time. `forget` always keeps the
+newest snapshot regardless of policy, so the remote's anchor is preserved
+automatically. For the source, replicate before running `forget` to ensure remote
+receives all intermediate snapshots before any are pruned.
 
 ```bash
 syncoid tank/documents backup@nas:tank/documents
-zfstic forget --keep-last 5 --keep-daily 3 --keep-weekly 2 tank/documents
-```
-
-ZFS sends are chain-dependent. syncoid finds its incremental base by matching
-snapshot GUIDs between source and destination. Prune first and you might destroy
-exactly the snapshot syncoid needs. zfstic guarantees the most recent snapshot
-always survives `forget` - shown as `[latest]` if no other policy claims it. Since
-you replicated first, that snapshot exists on both sides and syncoid can always do
-an incremental send. The order in which you prune local vs remote doesn't matter -
-what matters is that replication comes before either.
-
-Once local pruning is done, apply a completely different policy on the remote:
-
-```bash
+zfstic forget --keep-last 5 --keep-daily 7 tank/documents
 ssh backup@nas zfstic forget \
     --keep-daily 30 --keep-monthly 12 --keep-yearly 5 \
     tank/documents
 ```
 
-Local and remote policies are completely independent. That is the whole point.
+The policies on each side are independent. That's the whole point. One cron job
+takes snapshots, another replicates and prunes both sides. Each cycle is
+self-contained.
 
 ---
 
@@ -172,9 +175,8 @@ zfstic snapshot [options] <dataset>
   -h, --help         Show help
 ```
 
-Creates `<dataset>@zfstic-<timestamp><tz>[-label]`. The timestamp uses local time
-with the system timezone abbreviation. `-r` issues a single `zfs snapshot -r`,
-executed atomically by ZFS - every dataset in the tree gets an identical timestamp.
+Creates `<dataset>@zfstic-<timestamp><tz>[-label]`. `-r` issues a single
+`zfs snapshot -r`, executed atomically by ZFS.
 
 ### `zfstic forget`
 
@@ -196,15 +198,8 @@ zfstic forget [options] <dataset>
   -h, --help          Show help
 ```
 
-At least one `--keep-*` flag is required. A snapshot kept by multiple policies
-shows all matching reasons. `-r` applies retention independently per dataset.
+At least one `--keep-*` flag is required. Multiple matching policies are all
+listed as reasons. `-r` applies retention independently per dataset.
 
-The most recently created snapshot is always kept even if no policy claims it
-(shown as `[latest]`). This ensures syncoid always has a common snapshot for
-incremental sends.
-
----
-
-## License
-
-[MIT](LICENSE)
+The newest snapshot is always kept regardless of policy (shown as `[latest]`).
+Safety net - not a substitute for correct replication policy design.

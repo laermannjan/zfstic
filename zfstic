@@ -5,7 +5,7 @@
 # Requirements: bash 4+, awk (gawk/mawk/BSD awk with strftime), zfs in PATH
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Usage
@@ -51,29 +51,48 @@ OPTIONS:
     -h, --help          Show this help
 
 NOTES:
-    At least one --keep-* option is required as a safety guard.
+    At least one --keep-* option is required.
 
-    --keep-daily n means: for each of the last n calendar days, keep the oldest
-    snapshot in that day. Days with no snapshots don't consume a slot - if you
-    only snapshot weekly, --keep-daily 7 keeps at most 7 snapshots but they may
-    span 7 weeks. zfstic keeps the oldest snapshot per period, not the newest -
-    this ensures each policy anchors to a distinct point in time.
+    --keep-daily n keeps the oldest snapshot in each of the last n calendar days.
+    Days with no snapshots contribute nothing - fewer retained snapshots, not more
+    time covered. zfstic keeps the oldest per period, not the newest, so each
+    policy anchors to a distinct point in time.
 
-    The most recently created snapshot is ALWAYS kept regardless of policy
-    (shown as reason "latest"). This ensures syncoid can always find a common
-    base snapshot for incremental replication.
+    The newest snapshot is always kept regardless of policy (shown as "latest").
+    Safety net - not a substitute for correct replication policy design.
 
-    IMPORTANT - when using with syncoid, replicate BEFORE forgetting locally:
+    When using with syncoid (or zfs send directly):
+
+    Incremental sends only ship blocks born after a reference point (txg). The
+    source needs a snapshot or bookmark at that point; the destination needs the
+    actual snapshot, because the stream omits blocks already present there.
+
+    syncoid by default creates a syncoid_-prefixed snapshot on both sides before
+    each send and deletes old ones -- these serve as the common anchor for
+    incremental sends. zfstic's default --prefix zfstic- means forget won't
+    touch them. For lighter source-side footprint, syncoid --create-bookmark
+    --no-sync-snap creates a bookmark on the source with no sync snapshot on
+    either side; the destination still needs its snapshot -- and forget's
+    keep-latest guarantees it survives, since the youngest remote snapshot is
+    exactly the one the bookmark points to. You can also manage everything
+    manually with zfs send and zfs bookmark.
+
+    forget always keeps the newest snapshot regardless of policy (shown as
+    "latest"), so the remote's anchor is never accidentally removed. For
+    coverage -- ensuring remote gets the granularity you want -- run replication
+    before forgetting locally.
 
         zfstic snapshot tank/data
         syncoid tank/data backup@remote:tank/backup     # replicate first
-        zfstic forget tank/data --keep-hourly 24        # then prune local
+        zfstic forget tank/data --keep-last 5 --keep-daily 7
         ssh backup@remote zfstic forget tank/backup \
-            --keep-monthly 12 --keep-yearly 5           # prune remote with different policy
+            --keep-monthly 12 --keep-yearly 5           # prune remote independently
 
-    syncoid matches snapshots by GUID (not name). As long as you replicate
-    before forgetting, the newest local snapshot will exist on both sides,
-    giving syncoid a common base for the next incremental send.
+        zfstic snapshot tank/data
+        syncoid tank/data backup@remote:tank/backup     # replicate first
+        zfstic forget tank/data --keep-daily 8          # then prune local
+        ssh backup@remote zfstic forget tank/backup \
+            --keep-monthly 12 --keep-yearly 5           # prune remote independently
 
 EXAMPLES:
     # Keep 24 hourly + 7 daily locally, preview first
@@ -249,7 +268,7 @@ apply_retention() {
             if (ky > 0 && (yb[i] in yk) && yk[yb[i]] == i)
                 reasons = reasons (reasons ? ", " : "") "yearly"
 
-            # Implicit keep-latest: newest snapshot = first row (newest-first)
+            # Safety net: always keep at least one snapshot
             if (i == 1 && reasons == "")
                 reasons = "latest"
 
