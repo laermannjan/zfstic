@@ -28,10 +28,21 @@ apply_retention()  zfs list | sort | awk retention kernel → print plan → zfs
 
 ## Key design decisions
 
-**Retention algorithm** (`apply_retention`): one `awk` pass per dataset. Snapshots
-are sorted newest-first; awk walks once maintaining per-policy counters and
-bucket-seen maps (strftime-keyed). A snapshot is removed only if no policy claims
-it. The awk output is tab-separated: `action  snap_name  epoch  reasons  display_date`.
+**Retention algorithm** (`apply_retention`): one `awk` invocation per dataset.
+Snapshots are sorted newest-first. The awk program has three phases:
+
+- BEGIN: pre-compute the set of in-scope calendar buckets per policy using
+  `systime()`. E.g. `--keep-daily 3` computes today, yesterday, day-before. Only
+  snapshots falling in these specific calendar periods are eligible to be kept by
+  that policy. Days/weeks/months with no snapshots do not consume a slot.
+- Main loop: record which bucket key each snapshot falls into (strftime-keyed).
+- END block, phase 2a: for each in-scope bucket, select the OLDEST snapshot.
+  Achieved by iterating i=1..NR and always overwriting the bucket's representative
+  index — last write wins, and since we iterate newest-to-oldest, the last write
+  is the oldest snapshot. keep-last uses `i <= kl` (first N = most recent N).
+  Implicit keep-latest uses `i == 1` (first row = newest).
+
+Output is tab-separated: `action  snap_name  epoch  reasons  display_date`.
 
 **Implicit keep-latest**: the newest snapshot is always kept, even if no policy
 would claim it (shown as reason "latest"). Two purposes:
@@ -55,10 +66,11 @@ command would duplicate syncoid without improving on it.
 
 ## Snapshot naming
 
-`zfstic-<UTC-ISO8601>[-label]`  e.g. `zfstic-2026-02-22T10:00:00-hourly`
+`zfstic-<local-ISO8601><TZ>[-label]`  e.g. `zfstic-2026-02-22T10:00:00CET-migration`
 
-Timestamps are UTC. Display dates in `forget` output use local timezone (awk
-strftime default).
+Timestamps use local time with timezone abbreviation (`date +%Y-%m-%dT%H:%M:%S%Z`).
+Override with `--timezone TZ` (e.g. `--timezone UTC`). `%Z` produces alphabetic
+abbreviations (UTC, CET, EST, etc.) which are valid ZFS snapshot name characters.
 
 ## The common-snapshot problem (important for forget design)
 

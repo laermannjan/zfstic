@@ -37,26 +37,35 @@ USAGE:
 
 OPTIONS:
     --keep-last    n    Keep the n most recent snapshots unconditionally
-    --keep-hourly  n    Keep the most recent snapshot per hour, up to n hours
-    --keep-daily   n    Keep the most recent snapshot per day, up to n days
-    --keep-weekly  n    Keep the most recent snapshot per ISO week, up to n weeks
-    --keep-monthly n    Keep the most recent snapshot per month, up to n months
-    --keep-yearly  n    Keep the most recent snapshot per year, up to n years
+    --keep-hourly  n    Keep the earliest snapshot per hour for the last n hours
+    --keep-daily   n    Keep the earliest snapshot per day for the last n days
+    --keep-weekly  n    Keep the earliest snapshot per ISO week for the last n weeks
+    --keep-monthly n    Keep the earliest snapshot per month for the last n months
+    --keep-yearly  n    Keep the earliest snapshot per year for the last n years
     -r, --recursive     Apply to dataset and all child datasets independently
     -n, --dry-run       Show what would be removed without actually removing
     --prefix <pfx>      Only consider snapshots whose name starts with <pfx>
+                        Default: "zfstic-". Pass --prefix "" to manage all snapshots.
+    --timezone <tz>     Timezone for computing period boundaries (e.g. UTC, America/New_York)
+                        Default: system local time
     -h, --help          Show this help
 
 NOTES:
     At least one --keep-* option is required as a safety guard.
 
+    --keep-daily n means: for each of the last n calendar days, keep the oldest
+    snapshot in that day. Days with no snapshots don't consume a slot - if you
+    only snapshot weekly, --keep-daily 7 keeps at most 7 snapshots but they may
+    span 7 weeks. zfstic keeps the oldest snapshot per period, not the newest -
+    this ensures each policy anchors to a distinct point in time.
+
     The most recently created snapshot is ALWAYS kept regardless of policy
     (shown as reason "latest"). This ensures syncoid can always find a common
     base snapshot for incremental replication.
 
-    IMPORTANT — when using with syncoid, replicate BEFORE forgetting locally:
+    IMPORTANT - when using with syncoid, replicate BEFORE forgetting locally:
 
-        zfstic snapshot tank/data --label hourly
+        zfstic snapshot tank/data
         syncoid tank/data backup@remote:tank/backup     # replicate first
         zfstic forget tank/data --keep-hourly 24        # then prune local
         ssh backup@remote zfstic forget tank/backup \
@@ -66,11 +75,6 @@ NOTES:
     before forgetting, the newest local snapshot will exist on both sides,
     giving syncoid a common base for the next incremental send.
 
-    Caveat: syncoid must run at least as often as your local retention window.
-    If local keeps 24 hourly snapshots but syncoid only runs weekly, the common
-    snapshot will eventually fall outside the local window and syncoid will need
-    to do a full send.
-
 EXAMPLES:
     # Keep 24 hourly + 7 daily locally, preview first
     zfstic forget --keep-hourly 24 --keep-daily 7 --dry-run tank/data
@@ -78,8 +82,8 @@ EXAMPLES:
     # Apply recursively to dataset and all children
     zfstic forget --keep-hourly 24 --keep-daily 7 -r tank
 
-    # Only manage zfstic-created snapshots (leave sanoid snapshots alone)
-    zfstic forget --keep-daily 7 --prefix zfstic- tank/data
+    # Manage ALL snapshots including sanoid/manual (clear the default prefix)
+    zfstic forget --keep-daily 7 --prefix "" tank/data
 EOF
 }
 
@@ -91,27 +95,30 @@ USAGE:
     zfstic snapshot [options] <dataset>
 
 OPTIONS:
-    --label <name>   Append a label to the snapshot name
-    -r, --recursive  Snapshot dataset and all children atomically
-    -h, --help       Show this help
+    --label <name>      Append a label to the snapshot name
+    --timezone <tz>     Use this timezone for the timestamp (e.g. America/New_York)
+                        Default: system local time
+    -r, --recursive     Snapshot dataset and all children atomically
+    -h, --help          Show this help
 
 SNAPSHOT NAMING:
-    Without label:  <dataset>@zfstic-2026-02-22T10:00:00
-    With label:     <dataset>@zfstic-2026-02-22T10:00:00-hourly
+    Without label:  <dataset>@zfstic-2026-02-22T10:00:00CET
+    With label:     <dataset>@zfstic-2026-02-22T10:00:00CET-migration
 
-    Timestamps are UTC. Use --prefix zfstic- with forget to scope retention
-    to only zfstic-managed snapshots.
+    Timestamps use local time with a timezone abbreviation. forget defaults to
+    --prefix zfstic- so these snapshots are automatically scoped.
 
 EXAMPLES:
     zfstic snapshot tank/data
-    zfstic snapshot --label hourly tank/data
-    zfstic snapshot -r --label daily tank
+    zfstic snapshot --label migration tank/data
+    zfstic snapshot -r tank
+    zfstic snapshot --timezone UTC tank/data
 EOF
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # apply_retention <dataset> <keep_last> <keep_hourly> <keep_daily>
-#                 <keep_weekly> <keep_monthly> <keep_yearly> <prefix> <dry_run>
+#                 <keep_weekly> <keep_monthly> <keep_yearly> <prefix> <dry_run> <timezone>
 #
 # Lists snapshots for the given dataset, applies retention policies via a single
 # awk pass, prints the keep/remove plan, and destroys the removes (unless dry_run).
@@ -127,6 +134,7 @@ apply_retention() {
     local keep_yearly="$7"
     local prefix="$8"
     local dry_run="${9}"
+    local timezone="${10}"
 
     # List snapshots for this dataset only (no recursion; caller handles that).
     # -p gives parseable (epoch) timestamps. Sort newest-first.
@@ -147,19 +155,15 @@ apply_retention() {
 
     [[ -z "$raw" ]] && return 0
 
-    # ── Retention algorithm ────────────────────────────────────────────────────
-    # Single awk pass over snapshots (sorted newest-first).
-    # For each enabled policy, keep the most recent snapshot per time bucket
-    # (hour / day / ISO-week / month / year), up to the configured limit.
-    # A snapshot kept by multiple policies accumulates all reasons.
-    #
-    # Implicit keep-latest: if no policy keeps the newest snapshot, it is kept
-    # anyway with reason "latest". This guarantees syncoid always has a common
-    # base for incremental replication after local retention is applied.
-    #
-    # Output (tab-separated): action  snap_name  epoch  reasons  display_date
+    # Two-phase awk pass (input: newest-first).
+    # BEGIN: pre-compute the last N calendar periods per policy using systime().
+    # Phase 1 (main body): record which bucket each snapshot falls into.
+    # Phase 2 (END): for each in-scope bucket, select the oldest snapshot.
+    #   Iterating i=1..NR over newest-first input, last-write-wins = oldest.
     local results
-    results=$(printf '%s\n' "$raw" | awk \
+    results=$(
+        [[ -n "$timezone" ]] && export TZ="$timezone"
+        printf '%s\n' "$raw" | awk \
         -v kl="$keep_last"    \
         -v kh="$keep_hourly"  \
         -v kd="$keep_daily"   \
@@ -167,8 +171,39 @@ apply_retention() {
         -v km="$keep_monthly" \
         -v ky="$keep_yearly"  \
     'BEGIN {
-        cnt_l=0; cnt_h=0; cnt_d=0; cnt_w=0; cnt_m=0; cnt_y=0
-        total=0
+        now = systime()
+        if (kh > 0) {
+            for (i = 0; i < kh; i++)
+                sh[strftime("%Y%m%d%H", now - i * 3600)] = 1
+        }
+        if (kd > 0) {
+            for (i = 0; i < kd; i++)
+                sd[strftime("%Y%m%d", now - i * 86400)] = 1
+        }
+        if (kw > 0) {
+            # Anchor to Monday of the current week then step back kw weeks.
+            # %V = ISO week number; %Y instead of %G for mawk compat
+            # (minor year-boundary edge case on Dec 28 - Jan 3 accepted)
+            dow = strftime("%w", now) + 0
+            days_to_mon = (dow == 0) ? 6 : (dow - 1)
+            mon = now - days_to_mon * 86400
+            for (i = 0; i < kw; i++)
+                sw[strftime("%Y%V", mon - i * 7 * 86400)] = 1
+        }
+        if (km > 0) {
+            cy = strftime("%Y", now) + 0
+            cm = strftime("%m", now) + 0
+            for (i = 0; i < km; i++) {
+                y = cy; m = cm - i
+                while (m <= 0) { m += 12; y-- }
+                sm[sprintf("%04d%02d", y, m)] = 1
+            }
+        }
+        if (ky > 0) {
+            cy = strftime("%Y", now) + 0
+            for (i = 0; i < ky; i++)
+                sy[sprintf("%04d", cy - i)] = 1
+        }
     }
     {
         full  = $1
@@ -176,111 +211,74 @@ apply_retention() {
         at    = index(full, "@")
         snap  = substr(full, at + 1)
         dt    = strftime("%Y-%m-%d %H:%M:%S", epoch)
-        total++
 
-        reasons = ""
+        snaps[NR]  = snap
+        epochs[NR] = epoch
+        dts[NR]    = dt
 
-        # --keep-last: keep the N most recent unconditionally
-        if (kl > 0 && cnt_l < kl) {
-            reasons = reasons (reasons ? ", " : "") "last"
-            cnt_l++
+        if (kh > 0) hb[NR] = strftime("%Y%m%d%H", epoch)
+        if (kd > 0) db[NR] = strftime("%Y%m%d",   epoch)
+        if (kw > 0) wb[NR] = strftime("%Y%V",      epoch)
+        if (km > 0) mb[NR] = strftime("%Y%m",      epoch)
+        if (ky > 0) yb[NR] = strftime("%Y",        epoch)
+    }
+    END {
+        for (i = 1; i <= NR; i++) {
+            if (kh > 0 && (hb[i] in sh)) hk[hb[i]] = i
+            if (kd > 0 && (db[i] in sd)) dk[db[i]] = i
+            if (kw > 0 && (wb[i] in sw)) wk[wb[i]] = i
+            if (km > 0 && (mb[i] in sm)) mk[mb[i]] = i
+            if (ky > 0 && (yb[i] in sy)) yk[yb[i]] = i
         }
 
-        # --keep-hourly
-        if (kh > 0) {
-            b = strftime("%Y%m%d%H", epoch)
-            if (!(b in sh) && cnt_h < kh) {
+        for (i = 1; i <= NR; i++) {
+            reasons = ""
+
+            # keep-last: N most recent = first N rows in newest-first order
+            if (kl > 0 && i <= kl)
+                reasons = "last"
+
+            if (kh > 0 && (hb[i] in hk) && hk[hb[i]] == i)
                 reasons = reasons (reasons ? ", " : "") "hourly"
-                sh[b] = 1; cnt_h++
-            }
-        }
-
-        # --keep-daily
-        if (kd > 0) {
-            b = strftime("%Y%m%d", epoch)
-            if (!(b in sd) && cnt_d < kd) {
+            if (kd > 0 && (db[i] in dk) && dk[db[i]] == i)
                 reasons = reasons (reasons ? ", " : "") "daily"
-                sd[b] = 1; cnt_d++
-            }
-        }
-
-        # --keep-weekly  (%V = ISO week num; %Y used instead of %G for mawk compat;
-        #                 minor year-boundary edge case on Dec 28 - Jan 3 accepted)
-        if (kw > 0) {
-            b = strftime("%Y%V", epoch)
-            if (!(b in sw) && cnt_w < kw) {
+            if (kw > 0 && (wb[i] in wk) && wk[wb[i]] == i)
                 reasons = reasons (reasons ? ", " : "") "weekly"
-                sw[b] = 1; cnt_w++
-            }
-        }
-
-        # --keep-monthly
-        if (km > 0) {
-            b = strftime("%Y%m", epoch)
-            if (!(b in sm) && cnt_m < km) {
+            if (km > 0 && (mb[i] in mk) && mk[mb[i]] == i)
                 reasons = reasons (reasons ? ", " : "") "monthly"
-                sm[b] = 1; cnt_m++
-            }
-        }
-
-        # --keep-yearly
-        if (ky > 0) {
-            b = strftime("%Y", epoch)
-            if (!(b in sy) && cnt_y < ky) {
+            if (ky > 0 && (yb[i] in yk) && yk[yb[i]] == i)
                 reasons = reasons (reasons ? ", " : "") "yearly"
-                sy[b] = 1; cnt_y++
+
+            # Implicit keep-latest: newest snapshot = first row (newest-first)
+            if (i == 1 && reasons == "")
+                reasons = "latest"
+
+            if (reasons != "") {
+                print "keep"   "\t" snaps[i] "\t" epochs[i] "\t" reasons "\t" dts[i]
+            } else {
+                print "remove" "\t" snaps[i] "\t" epochs[i] "\t"          "\t" dts[i]
             }
-        }
-
-        # Implicit keep-latest safety: if newest snapshot would be removed, save it
-        if (total == 1 && reasons == "") {
-            reasons = "latest"
-        }
-
-        if (reasons != "") {
-            print "keep"   "\t" snap "\t" epoch "\t" reasons "\t" dt
-        } else {
-            print "remove" "\t" snap "\t" epoch "\t"         "\t" dt
         }
     }')
 
-    # Count outcomes
-    local n_keep n_remove n_total
+    local n_keep n_remove
     n_keep=$(awk -F'\t' '$1=="keep"  {c++} END{print c+0}' <<< "$results")
     n_remove=$(awk -F'\t' '$1=="remove"{c++} END{print c+0}' <<< "$results")
-    n_total=$(( n_keep + n_remove ))
 
-    # ── Print plan ─────────────────────────────────────────────────────────────
-    local sep="────────────────────────────────────────────────────────────"
-    printf '\n%s\n%s\n' "$dataset" "$sep"
-
-    if [[ "$dry_run" == "true" ]]; then
-        printf 'Would keep %d of %d snapshot(s)\n' "$n_keep" "$n_total"
-    else
-        printf 'Keeping %d of %d snapshot(s)\n' "$n_keep" "$n_total"
-    fi
-
-    if [[ "$n_keep" -gt 0 ]]; then
-        printf '\n  To keep:\n'
-        while IFS=$'\t' read -r action snap _epoch reasons dt; do
-            [[ "$action" != "keep" ]] && continue
-            printf '    %-19s  %-48s  %s\n' "$dt" "$snap" "$reasons"
-        done <<< "$results"
-    fi
-
-    if [[ "$n_remove" -gt 0 ]]; then
-        if [[ "$dry_run" == "true" ]]; then
-            printf '\n  Would remove:\n'
+    printf '\n  %s:\n' "$dataset"
+    while IFS=$'\t' read -r action snap _epoch reasons _dt; do
+        if [[ "$action" == "keep" ]]; then
+            printf '    %-6s  %s\t[%s]\n' "$action" "$snap" "$reasons"
         else
-            printf '\n  To remove:\n'
+            printf '    %-6s  %s\n' "$action" "$snap"
         fi
-        while IFS=$'\t' read -r action snap _epoch _reasons dt; do
-            [[ "$action" != "remove" ]] && continue
-            printf '    %-19s  %s\n' "$dt" "$snap"
-        done <<< "$results"
+    done <<< "$results"
+    if [[ "$dry_run" == "true" ]]; then
+        printf '    --- %d keep, %d remove --- (dry run)\n' "$n_keep" "$n_remove"
+    else
+        printf '    --- %d keep, %d remove ---\n' "$n_keep" "$n_remove"
     fi
 
-    # ── Destroy (unless dry-run) ───────────────────────────────────────────────
     if [[ "$dry_run" != "true" && "$n_remove" -gt 0 ]]; then
         local errors=0
         while IFS=$'\t' read -r action snap _epoch _reasons _dt; do
@@ -292,8 +290,6 @@ apply_retention() {
         done <<< "$results"
         [[ "$errors" -gt 0 ]] && return 1
     fi
-
-    return 0
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -303,7 +299,7 @@ apply_retention() {
 cmd_forget() {
     local keep_last=0 keep_hourly=0 keep_daily=0 keep_weekly=0
     local keep_monthly=0 keep_yearly=0
-    local recursive=false dry_run=false prefix="" dataset=""
+    local recursive=false dry_run=false prefix="zfstic-" dataset="" timezone=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -316,6 +312,7 @@ cmd_forget() {
             -r|--recursive) recursive=true; shift ;;
             -n|--dry-run)   dry_run=true;   shift ;;
             --prefix)       prefix="${2:?'--prefix requires a value'}"; shift 2 ;;
+            --timezone)     timezone="${2:?'--timezone requires a value'}"; shift 2 ;;
             -h|--help)      usage_forget; return 0 ;;
             -*)  printf 'error: unknown option: %s\n' "$1" >&2; return 1 ;;
             *)   dataset="$1"; shift ;;
@@ -347,7 +344,7 @@ cmd_forget() {
         apply_retention "$ds" \
             "$keep_last" "$keep_hourly" "$keep_daily" \
             "$keep_weekly" "$keep_monthly" "$keep_yearly" \
-            "$prefix" "$dry_run" || errors=$(( errors + 1 ))
+            "$prefix" "$dry_run" "$timezone" || errors=$(( errors + 1 ))
     done <<< "$datasets"
 
     if [[ "$dry_run" == "true" ]]; then
@@ -355,7 +352,6 @@ cmd_forget() {
     fi
 
     [[ "$errors" -gt 0 ]] && return 1
-    return 0
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -363,11 +359,12 @@ cmd_forget() {
 # ──────────────────────────────────────────────────────────────────────────────
 
 cmd_snapshot() {
-    local label="" recursive=false dataset=""
+    local label="" recursive=false dataset="" timezone=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --label)        label="${2:?'--label requires a value'}"; shift 2 ;;
+            --timezone)     timezone="${2:?'--timezone requires a value'}"; shift 2 ;;
             -r|--recursive) recursive=true; shift ;;
             -h|--help)      usage_snapshot; return 0 ;;
             -*)  printf 'error: unknown option: %s\n' "$1" >&2; return 1 ;;
@@ -381,7 +378,11 @@ cmd_snapshot() {
     fi
 
     local ts snap_name
-    ts=$(date -u +%Y-%m-%dT%H:%M:%S)
+    if [[ -n "$timezone" ]]; then
+        ts=$(TZ="$timezone" date +%Y-%m-%dT%H:%M:%S%Z)
+    else
+        ts=$(date +%Y-%m-%dT%H:%M:%S%Z)
+    fi
     snap_name="zfstic-${ts}"
     [[ -n "$label" ]] && snap_name="${snap_name}-${label}"
 
