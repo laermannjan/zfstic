@@ -5,7 +5,7 @@
 # Requirements: bash 4+, awk (gawk/mawk/BSD awk with strftime), zfs in PATH
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Usage
@@ -307,7 +307,7 @@ apply_retention() {
                 errors=$(( errors + 1 ))
             fi
         done <<< "$results"
-        [[ "$errors" -gt 0 ]] && return 1
+        [[ "$errors" -eq 0 ]]
     fi
 }
 
@@ -370,7 +370,7 @@ cmd_forget() {
         printf '\n[dry run] No snapshots were removed.\n'
     fi
 
-    [[ "$errors" -gt 0 ]] && return 1
+    [[ "$errors" -eq 0 ]]
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
