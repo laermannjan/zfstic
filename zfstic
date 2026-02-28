@@ -5,7 +5,7 @@
 # Requirements: bash 4+, awk (gawk/mawk/BSD awk with strftime), zfs in PATH
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Usage
@@ -396,12 +396,19 @@ cmd_snapshot() {
         return 1
     fi
 
-    local ts snap_name
-    if [[ -n "$timezone" ]]; then
-        ts=$(TZ="$timezone" date +%Y-%m-%dT%H:%M:%S%z)
+    local ts snap_name off
+    local tz=()
+    [[ -n "$timezone" ]] && tz=(env "TZ=$timezone")
+
+    off=$("${tz[@]}" date +%z)
+    if [[ "$off" == -* ]]; then
+        off="GMT-${off:1:2}:${off:3:2}"
     else
-        ts=$(date +%Y-%m-%dT%H:%M:%S%z)
+        off="GMT${off:1:2}:${off:3:2}"
     fi
+
+    ts=$("${tz[@]}" date "+%Y-%m-%dT%H:%M:%S${off}")
+
     snap_name="zfstic-${ts}"
     [[ -n "$label" ]] && snap_name="${snap_name}-${label}"
 
